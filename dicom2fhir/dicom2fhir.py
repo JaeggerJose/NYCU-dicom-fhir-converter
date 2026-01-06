@@ -4,7 +4,10 @@ from fhir import resources as fr
 from pydicom import dcmread
 from pydicom import dataset
 
-from . import dicom2fhirutils
+try:
+    from . import dicom2fhirutils
+except ImportError:
+    import dicom2fhirutils
 
 
 def _add_imaging_study_instance(study: fr.imagingstudy.ImagingStudy, series: fr.imagingstudy.ImagingStudySeries,
@@ -168,33 +171,112 @@ def _create_imaging_study(ds, fp, dcmDir) -> fr.imagingstudy.ImagingStudy:
 
     study.reasonCode = dicom2fhirutils.gen_reason(reason, reasonStr)
 
+    # 新增: 提取未映射的 DICOM metadata (稍後在 JSON 序列化時處理)
+    try:
+        unmapped_metadata = dicom2fhirutils.extract_unmapped_dicom_metadata(ds)
+        if unmapped_metadata:
+            # 將 metadata 儲存為物件的自訂屬性，稍後在 JSON 序列化時使用
+            study._unmapped_metadata = unmapped_metadata
+            
+    except Exception as e:
+        print(f"警告: 無法提取未映射的 DICOM metadata: {e}")
+
     study.numberOfSeries = 0
     study.numberOfInstances = 0
     _add_imaging_study_series(study, ds, fp)
     return study
 
 
-def process_dicom_2_fhir(dcmDir: str) -> fr.imagingstudy.ImagingStudy:
+def process_dicom_2_fhir(dcmDir: str) -> list[tuple[fr.imagingstudy.ImagingStudy, str]]:
     files = []
-    # TODO: subdirectory must be traversed
+    # 使用 os.walk 遞迴遍歷所有子目錄
     for r, d, f in os.walk(dcmDir):
         for file in f:
             files.append(os.path.join(r, file))
 
-    studyInstanceUID = None
-    imagingStudy = None
+    studies = {}  # Using a dictionary to store studies by StudyInstanceUID
+    study_dirs = {} # Store the directory path for each study
+
     for fp in files:
         try:
             with dcmread(fp, None, [0x7FE00010], force=True) as ds:
-                if studyInstanceUID is None:
-                    studyInstanceUID = ds.StudyInstanceUID
-                if studyInstanceUID != ds.StudyInstanceUID:
-                    raise Exception("Incorrect DCM path, more than one study detected")
-                    return None
-                if imagingStudy is None:
-                    imagingStudy = _create_imaging_study(ds, fp, dcmDir)
+                study_uid = ds.StudyInstanceUID
+                
+                # Get the directory of the current file
+                current_file_dir = os.path.dirname(os.path.abspath(fp))
+                
+                if study_uid not in studies:
+                    # New study found
+                    studies[study_uid] = _create_imaging_study(ds, fp, dcmDir)
+                    # Initialize study directory (use the first file's directory as base)
+                    study_dirs[study_uid] = current_file_dir
                 else:
-                    _add_imaging_study_series(imagingStudy, ds, fp)
+                    # Existing study, add series/instance
+                    _add_imaging_study_series(studies[study_uid], ds, fp)
+                    
+                    # Update study directory: find common prefix if files are in different subdirs
+                    # For now, we assume all files of a study are rooted under one main folder.
+                    # We can stick to the first file's directory or try to find common path.
+                    # Simple approach: if new file is in a parent directory of current stored path, update it.
+                    common = os.path.commonpath([study_dirs[study_uid], current_file_dir])
+                    study_dirs[study_uid] = common
+                    
         except Exception:
-            pass  # file is not a dicom file
-    return imagingStudy
+            pass  # file is not a dicom file or other error
+            
+    # Return list of tuples: (ImagingStudy, StudyDirectoryPath)
+    return [(studies[uid], study_dirs[uid]) for uid in studies]
+
+
+def process_dicom_2_fhir_with_endpoint(dcmDir: str, endpoint_address: str = None, endpoint_id: str = None,
+                                       imagingstudy_profile_url: str = "http://hl7.org/fhir/StructureDefinition/ImagingStudy",
+                                       endpoint_profile_url: str = "http://hl7.org/fhir/StructureDefinition/Endpoint"):
+    """
+    產生 ImagingStudy 列表，並同時建立 Endpoint 資源，
+    將 ImagingStudy.endpoint 設為 Reference("Endpoint/{id}")。
+
+    Args:
+        dcmDir (str): DICOM 目錄
+        endpoint_address (str): 已不使用 (由各 Study 自動偵測路徑)
+        endpoint_id (str): 已不使用 (由各 Study 自動產生 UUID)
+
+    Returns:
+        list: List of tuples (ImagingStudy, Endpoint)
+    """
+    study_results = process_dicom_2_fhir(dcmDir)
+    
+    if not study_results:
+        return []
+
+    results = []
+    
+    for study, study_dir in study_results:
+        # Create a unique endpoint for this study
+        this_endpoint_id = str(uuid.uuid4())
+        this_endpoint_address = "file://" + study_dir
+        
+        ep = dicom2fhirutils.create_endpoint(this_endpoint_id, this_endpoint_address)
+        
+        try:
+            ep.meta = fr.meta.Meta()
+            ep.meta.profile = [endpoint_profile_url]
+        except Exception:
+            pass
+
+        # 以 Endpoint Reference 取代原本的檔案路徑
+        study.endpoint = []
+        endpoint_ref = fr.fhirreference.FHIRReference()
+        endpoint_ref.reference = f"Endpoint/{this_endpoint_id}"
+        study.endpoint.append(endpoint_ref)
+
+        # 設定 meta.profile (保留現有的 extension)
+        try:
+            if study.meta is None:
+                study.meta = fr.meta.Meta()
+            study.meta.profile = [imagingstudy_profile_url]
+        except Exception:
+            pass
+            
+        results.append((study, ep))
+
+    return results
